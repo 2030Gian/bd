@@ -7,11 +7,11 @@ Order = 4
 
 class Node:
 
-    def __init__(self, order=Order, is_leaf=True, records=[], children=[], next_node=-1, parent=-1):
+    def __init__(self, order=Order, is_leaf=True, records=None, children=None, next_node=-1, parent=-1):
         self.order = order
         self.is_leaf = is_leaf
-        self.records = records
-        self.children = children
+        self.records = list(records) if records is not None else []
+        self.children = list(children) if children is not None else []
         self.next_node = next_node
         self.parent = parent
     
@@ -96,6 +96,11 @@ class BPlusFile:
         self.PAGE_SIZE = (self.NODE_HEADER_SIZE + 4 + (Order * self.REC_SIZE) + 4 + ((Order + 1) * self.INT_SIZE) + 8)
         self.read_count = 0
         self.write_count = 0
+        
+        with open(self.filename, "rb") as f:
+            f.seek(0)
+            self.schema_size = struct.unpack('I', f.read(4))[0]
+        
         self._ensure_root()
 
 
@@ -122,10 +127,10 @@ class BPlusFile:
         return data_region // self.PAGE_SIZE
 
     def _read_node_at(self, f, schema_size, page: int):
+        self._inc_read()
         off = self._page_offset(schema_size, page)
         f.seek(off)
         data = f.read(self.PAGE_SIZE)
-        self._inc_read()
         return Node.unpack(data, self.REC_SIZE, self.format, self.schema)
 
     def _write_node_at(self, f, schema_size, page: int, node: Node):
@@ -150,12 +155,11 @@ class BPlusFile:
         return new_page
 
     def _ensure_root(self):
-        with open(self.filename, 'r+b') as f:
-            schema_size = self._read_schema_size(f)
-            total = self._total_pages(f, schema_size)
-            if total == 0:
+        with open(self.filename, "r+b") as f:
+            pages = self._total_pages(f, self.schema_size)
+            if pages < 2:
                 root = Node(is_leaf=True, records=[], children=[], next_node=-1, parent=-1)
-                self._append_node(f, schema_size, root)
+                self._append_node(f, self.schema_size, root)
 
     def _get_root_page(self):
         return 1
@@ -163,33 +167,70 @@ class BPlusFile:
     def _get_key_from_record(self, rec: Record, keyname: str):
         return rec.fields.get(keyname)
 
-    def _find_leaf_page(self, value, keyname):
-        with open(self.filename, 'rb') as f:
-            schema_size = self._read_schema_size(f)
-            page = self._get_root_page()
-            while True:
-                node = self._read_node_at(f, schema_size, page)
-                if node.is_leaf:
-                    return page, node
-                i = 0
-                while i < len(node.records) and value > self._get_key_from_record(node.records[i], keyname):
-                    i += 1
-                if i < len(node.children):
-                    page = node.children[i]
-                else:
-                    page = node.children[-1]
+    def _get_key_from_record(self, rec, keyname):
+        if isinstance(rec, Record):
+            return rec.fields.get(keyname)
+        if isinstance(rec, dict):
+            return rec.get(keyname)
+        return None
+
+    def _find_leaf_page(self, f, schema_size, value, keyname):
+        """
+        Localiza la hoja donde debería estar 'value'.
+        Ahora recibe file handle y schema_size para evitar reabrir archivo.
+        """
+        page = self._get_root_page()
+        total = max(2, self._total_pages(f, schema_size))
+        steps = 0
+
+        while True:
+            node = self._read_node_at(f, schema_size, page)
+            if node.is_leaf:
+                return page, node
+
+            if not node.children:
+                return page, node
+
+            i = 0
+            while i < len(node.records) and value > self._get_key_from_record(node.records[i], keyname):
+                i += 1
+
+            page = node.children[i] if i < len(node.children) else node.children[-1]
+            steps += 1
+            if steps > total + 1:
+                raise RuntimeError("BPlus: _find_leaf_page se loopéo; revisar estructura del árbol")
 
     def insert(self, record: dict, additional: dict):
         keyname = additional['key']
         record['deleted'] = False
         with open(self.filename, 'r+b') as f:
-            schema_size = self._read_schema_size(f)
-            leaf_page, leaf = self._find_leaf_page(record[keyname], keyname)
+            leaf_page, leaf = self._find_leaf_page(f, self.schema_size, record[keyname], keyname)
 
-            for r in leaf.records:
-                if not r.fields.get('deleted') and r.fields.get(keyname) == record[keyname]:
-                    if additional.get('unique'):
-                        return []
+            if additional.get('unique'):
+                val = record[keyname]
+                curr = leaf_page
+                visited = set()
+                total = max(2, self._total_pages(f, self.schema_size))
+                hops = 0
+                while curr != -1:
+                    if curr in visited:
+                        break
+                    visited.add(curr)
+                    node = self._read_node_at(f, self.schema_size, curr)
+                    for r in node.records:
+                        k = self._get_key_from_record(r, keyname)
+                        if k is None:
+                            continue
+                        if not r.fields.get('deleted') and k == val:
+                            return []
+                        if k > val:
+                            curr = -1
+                            break
+                    if curr != -1:
+                        curr = node.next_node
+                        hops += 1
+                        if hops > total + 1:
+                            break
 
             new_rec = Record(self.schema, self.format, record)
             i = 0
@@ -200,9 +241,9 @@ class BPlusFile:
 
             max_keys = Order - 1
             if len(leaf.records) > max_keys:
-                self._split_leaf(f, schema_size, leaf_page, leaf, additional)
+                self._split_leaf(f, self.schema_size, leaf_page, leaf, additional)
             else:
-                self._write_node_at(f, schema_size, leaf_page, leaf)
+                self._write_node_at(f, self.schema_size, leaf_page, leaf)
 
         return [new_rec.fields]
 
@@ -230,6 +271,10 @@ class BPlusFile:
         keyname = additional['key']
 
         promote_record = Record(self.schema, self.format, {keyname: key_value})
+        try:
+            promote_record.fields['deleted'] = True
+        except Exception:
+            pass
 
         if parent_page == -1:
             total = self._total_pages(f, schema_size)
@@ -286,14 +331,13 @@ class BPlusFile:
         keyname = additional['key']
         mid = len(node.records) // 2
         promote_rec = node.records[mid]
+        try:
+            promote_rec.fields['deleted'] = True
+        except Exception:
+            pass
         promote_key = self._get_key_from_record(promote_rec, keyname)
 
         right = Node(is_leaf=False, records=node.records[mid + 1:], children=node.children[mid + 1:], next_node=-1, parent=node.parent)
-        for child_page in right.children:
-            child = self._read_node_at(f, schema_size, child_page)
-            child.parent = None 
-            child.parent = None
-            child.parent = None
         node.records = node.records[:mid]
         node.children = node.children[:mid + 1]
 
@@ -311,156 +355,114 @@ class BPlusFile:
     def search(self, additional: dict, same_key: bool = True):
         keyname = additional['key']
         val = additional['value']
-        results = []
+        out = []
+
         with open(self.filename, 'rb') as f:
-            schema_size = self._read_schema_size(f)
+            total = max(2, self._total_pages(f, self.schema_size))
 
             if not same_key:
-                root_page = self._get_root_page()
-                page = root_page
+                # bajar a la hoja más a la izquierda, sin loops
+                page = self._get_root_page()
+                steps = 0
                 while True:
-                    node = self._read_node_at(f, schema_size, page)
-                    if node.is_leaf:
+                    node = self._read_node_at(f, self.schema_size, page)
+                    if node.is_leaf or not node.children:
                         break
-                    if len(node.children) > 0:
-                        page = node.children[0]
-                    else:
-                        break
+                    page = node.children[0]
+                    steps += 1
+                    if steps > total + 1:
+                        raise RuntimeError("BPlus: leftmost traversal en search() se loopéo")
+                    
+                curr = page
+                visited = set()
+                hops = 0
+                while curr != -1:
+                    if curr in visited:
+                        raise RuntimeError("BPlus: ciclo detectado en cadena de hojas (next_node)")
+                    visited.add(curr)
 
-                while page != -1:
-                    node = self._read_node_at(f, schema_size, page)
-                    for rec in node.records:
-                        if rec.fields.get(keyname) == val and not rec.fields.get('deleted'):
-                            del rec.fields['deleted']
-                            results.append(rec.fields)
-                            if additional.get('unique'):
-                                return results
-                    page = node.next_node
+                    leaf = self._read_node_at(f, self.schema_size, curr)
+                    for r in leaf.records:
+                        if not r.fields.get('deleted') and self._get_key_from_record(r, keyname) == val:
+                            out.append(dict(r.fields))
+                    curr = leaf.next_node
+                    hops += 1
+                    if hops > total + 1:
+                        raise RuntimeError("BPlus: recorrido de hojas excede páginas (posible ciclo)")
+                return out
 
-                return results
+            leaf_page, _ = self._find_leaf_page(f, self.schema_size, val, keyname)
+            curr = leaf_page
+            visited = set()
+            hops = 0
+            while curr != -1:
+                if curr in visited:
+                    raise RuntimeError("BPlus: ciclo detectado en cadena de hojas (next_node)")
+                visited.add(curr)
 
-            leaf_page, leaf = self._find_leaf_page(val, keyname)
-            leftmost_page = leaf_page
-            current = leaf_page
-            while True:
-                node = self._read_node_at(f, schema_size, current)
-                if node.parent == -1:
-                    break
-
-                parent = self._read_node_at(f, schema_size, node.parent)
-                try:
-                    idx = parent.children.index(current)
-                except ValueError:
-                    break
-
-                if idx == 0:
-                    break
-
-                left_sibling_page = parent.children[idx - 1]
-                left_sibling = self._read_node_at(f, schema_size, left_sibling_page)
-
-                if not left_sibling.records:
-                    break
-
-                last_key = self._get_key_from_record(left_sibling.records[-1], keyname)
-                if last_key < val:
-                    break
-
-                leftmost_page = left_sibling_page
-                current = left_sibling_page
-
-            page = leftmost_page
-            while page != -1:
-                node = self._read_node_at(f, schema_size, page)
-                found_any = False
-                for rec in node.records:
-                    rec_key = self._get_key_from_record(rec, keyname)
-                    if rec_key > val:
-                        # Past our target value, stop scanning
-                        return results
-                    if rec_key == val and not rec.fields.get('deleted'):
-                        del rec.fields['deleted']
-                        results.append(rec.fields)
-                        found_any = True
-                        if additional.get('unique'):
-                            return results
-
-                if node.records and not found_any:
-                    last_key = self._get_key_from_record(node.records[-1], keyname)
-                    if last_key < val:
-                        page = node.next_node
+                leaf = self._read_node_at(f, self.schema_size, curr)
+                for r in leaf.records:
+                    k = self._get_key_from_record(r, keyname)
+                    if k is None:
                         continue
-                    if last_key > val:
-                        break
-
-                page = node.next_node
-
-        return results
+                    if not r.fields.get('deleted') and k == val:
+                        out.append(dict(r.fields))
+                    elif k > val:
+                        return out 
+                curr = leaf.next_node
+                hops += 1
+                if hops > total + 1:
+                    raise RuntimeError("BPlus: recorrido de hojas excede páginas (posible ciclo)")
+        return out
 
     def range_search(self, additional: dict, same_key: bool = True):
         keyname = additional['key']
-        min_v = additional['min']
-        max_v = additional['max']
-        results = []
+        lo = additional['min']
+        hi = additional['max']
+        out = []
+
         with open(self.filename, 'rb') as f:
-            schema_size = self._read_schema_size(f)
+            total = max(2, self._total_pages(f, self.schema_size))
 
-            if not same_key:
-                root_page = self._get_root_page()
-                page = root_page
-                while True:
-                    node = self._read_node_at(f, schema_size, page)
-                    if node.is_leaf:
-                        break
-                    if len(node.children) > 0:
-                        page = node.children[0]
-                    else:
-                        break
+            leaf_page, _ = self._find_leaf_page(f, self.schema_size, lo, keyname)
+            curr = leaf_page
+            visited = set()
+            hops = 0
 
-                while page != -1:
-                    node = self._read_node_at(f, schema_size, page)
-                    for rec in node.records:
-                        val = rec.fields.get(keyname)
-                        if val is None:
-                            continue
-                        if val > max_v:
-                            return results
-                        if min_v <= val <= max_v and not rec.fields.get('deleted'):
-                            del rec.fields['deleted']
-                            results.append(rec.fields)
-                    page = node.next_node
+            while curr != -1:
+                if curr in visited:
+                    raise RuntimeError("BPlus: ciclo detectado en cadena de hojas (next_node)")
+                visited.add(curr)
 
-                return results
-
-            leaf_page, leaf = self._find_leaf_page(min_v, keyname)
-            page = leaf_page
-            while page != -1:
-                node = self._read_node_at(f, schema_size, page)
-                for rec in node.records:
-                    val = rec.fields.get(keyname)
-                    if val is None:
+                leaf = self._read_node_at(f, self.schema_size, curr)
+                for r in leaf.records:
+                    if r.fields.get('deleted'):
                         continue
-                    if val > max_v:
-                        return results
-                    if min_v <= val <= max_v and not rec.fields.get('deleted'):
-                        del rec.fields['deleted']
-                        results.append(rec.fields)
-                page = node.next_node
+                    k = self._get_key_from_record(r, keyname)
+                    if k is None:
+                        continue
+                    if k < lo:
+                        continue
+                    if k > hi:
+                        return out
+                    out.append(dict(r.fields))
 
-        return results
+                curr = leaf.next_node
+                hops += 1
+                if hops > total + 1:
+                    raise RuntimeError("BPlus: recorrido de hojas excede páginas (posible ciclo)")
+        return out
 
     def remove(self, additional: dict, same_key: bool = True):
         keyname = additional['key']
         val = additional['value']
         removed = []
         with open(self.filename, 'r+b') as f:
-            schema_size = self._read_schema_size(f)
-
             if not same_key:
                 root_page = self._get_root_page()
                 page = root_page
                 while True:
-                    node = self._read_node_at(f, schema_size, page)
+                    node = self._read_node_at(f, self.schema_size, page)
                     if node.is_leaf:
                         break
                     if len(node.children) > 0:
@@ -469,7 +471,7 @@ class BPlusFile:
                         break
 
                 while page != -1:
-                    node = self._read_node_at(f, schema_size, page)
+                    node = self._read_node_at(f, self.schema_size, page)
                     modified = False
                     for idx, rec in enumerate(node.records):
                         if rec.fields.get(keyname) == val and not rec.fields.get('deleted'):
@@ -480,17 +482,17 @@ class BPlusFile:
                             if additional.get('unique'):
                                 break
                     if modified:
-                        self._write_node_at(f, schema_size, page, node)
+                        self._write_node_at(f, self.schema_size, page, node)
                     if removed and additional.get('unique'):
                         break
                     page = node.next_node
 
                 return removed
 
-            leaf_page, leaf = self._find_leaf_page(val, keyname)
+            leaf_page, leaf = self._find_leaf_page(f, self.schema_size, val, keyname)
             page = leaf_page
             while page != -1:
-                node = self._read_node_at(f, schema_size, page)
+                node = self._read_node_at(f, self.schema_size, page)
                 modified = False
                 for idx, rec in enumerate(node.records):
                     if rec.fields.get(keyname) == val and not rec.fields.get('deleted'):
@@ -501,9 +503,31 @@ class BPlusFile:
                         if additional.get('unique'):
                             break
                 if modified:
-                    self._write_node_at(f, schema_size, page, node)
+                    self._write_node_at(f, self.schema_size, page, node)
                 if removed and additional.get('unique'):
                     break
                 page = node.next_node
 
         return removed
+    
+    def get_all(self):
+        result = []
+        with open(self.filename, 'rb') as f:
+            root_page = self._get_root_page()
+            page = root_page
+            while True:
+                node = self._read_node_at(f, self.schema_size, page)
+                if node.is_leaf:
+                    break
+                if len(node.children) > 0:
+                    page = node.children[0]
+                else:
+                    break
+
+            while page != -1:
+                node = self._read_node_at(f, self.schema_size, page)
+                for rec in node.records:
+                    if not rec.fields.get('deleted', False):
+                        result.append(dict(rec.fields))
+                page = node.next_node
+        return result

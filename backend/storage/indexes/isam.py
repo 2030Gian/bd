@@ -515,36 +515,53 @@ class IsamFile:
         indexformat, indexsize, _, _ = self.get_metrics(additional)
 
         with open(self.index_filename, "r+b") as indexfile:
-
             root = IndexPage.getPage(indexfile, 1, indexformat, indexsize)
-            self.read_count+=1
+            self.read_count += 1
 
+            # localizar leaf
             leaf_page = 0
-
             for i in range(len(root.indexes)):
-
                 if additional["value"] <= root.indexes[i].key:
                     leaf_page = root.indexes[i].page
                     break
-
-            if (leaf_page == 0):
-                return []
+            if leaf_page == 0:
+                leaf_page = root.indexes[-1].page
 
             leaf = IndexPage.getPage(indexfile, leaf_page, indexformat, indexsize)
-            self.read_count+=1
+            self.read_count += 1
 
+            # localizar data_page candidata dentro del leaf y recordar índice
             data_page = 0
-
+            leaf_idx = -1
             for i in range(len(leaf.indexes)):
                 if additional["value"] <= leaf.indexes[i].key:
                     data_page = leaf.indexes[i].page
+                    leaf_idx = i
                     break
+            if data_page == 0:
+                data_page = leaf.indexes[-1].page
+                leaf_idx = len(leaf.indexes) - 1
 
-            if (data_page == 0):
-                return []
-
+            # intento normal
             with open(self.filename, "r+b") as mainfile:
-                return self.search_on_page(additional, mainfile, data_page)
+                out = self.search_on_page(additional, mainfile, data_page)
+                if out:
+                    return out
+
+                # 🔁 Fallback robusto: busca en páginas vecinas del MISMO leaf
+                # (hacia atrás y hacia adelante). Corrige desalineaciones límite.
+                # hacia atrás
+                for j in range(leaf_idx - 1, -1, -1):
+                    out = self.search_on_page(additional, mainfile, leaf.indexes[j].page)
+                    if out:
+                        return out
+                # hacia adelante
+                for j in range(leaf_idx + 1, len(leaf.indexes)):
+                    out = self.search_on_page(additional, mainfile, leaf.indexes[j].page)
+                    if out:
+                        return out
+
+        return []
 
     def search_seq(self, additional: dict):
 
@@ -842,3 +859,53 @@ class IsamFile:
             return self.remove_index(additional)
         else:
             return self.remove_seq(additional)
+    
+
+    def get_all_on_page(self, mainfile, page_number):
+        mainfile.seek(0)
+        schema_size = struct.unpack("I", mainfile.read(4))[0]
+        self.read_count+=1
+
+        page = DataPage.getPage(mainfile, page_number, self.format, self.REC_SIZE, self.schema, schema_size)
+        self.read_count+=1
+
+        records = []
+
+        while True:
+
+            if len(page.records) == 0:
+                break
+
+            for record in page.records:
+
+                del record.fields["deleted"]
+                records.append(record.fields)
+
+            if (page.next_page != -1):
+                page = DataPage.getPage(mainfile, page.next_page, self.format, self.REC_SIZE, self.schema, schema_size)
+                self.read_count+=1
+
+            else:
+                break
+
+        return records
+
+
+    def get_all(self):
+
+        records = []
+
+        with open(self.filename, "r+b") as mainfile:
+
+            mainfile.seek(0)
+            schema_size = struct.unpack("I", mainfile.read(4))[0]
+            self.read_count+=1
+            
+            page_size = DataPage.HEADER_SIZE + (self.REC_SIZE * PAGE_FACTOR)
+
+            number_pages = DataPage.getTotalPages(mainfile,page_size,schema_size)
+
+            for page_number in range(1, number_pages+1):
+                records.extend(self.get_all_on_page(mainfile, page_number))
+        
+        return records

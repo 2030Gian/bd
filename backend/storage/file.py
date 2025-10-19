@@ -12,7 +12,6 @@ import os
 import copy
 
 DEBUG_IDX = os.getenv("BD2_DEBUG_INDEX", "0").lower() in ("1", "true", "yes")
-DEBUG_IDX = 1
 
 class File:
     # ------------------------------ helpers de catálogo ------------------------------ #
@@ -39,6 +38,7 @@ class File:
         self._io = self._new_io()
         self.last_io = self._new_io()
         self._index_usage = []
+        self._cached_rtree = {}  # {field_name: RTree_wrapper} для переиспользования
 
     # ------------------------------ IO accounting ------------------------------------ #
 
@@ -122,24 +122,50 @@ class File:
         prim = self.indexes.get("primary") or self.indexes.get("indexes") or {}
         return prim.get("index"), prim.get("filename")
 
-    def _make_rtree(self, field: str, *, heap_ok: bool):
+    def _make_rtree(self, field: str, *, heap_ok: bool, reuse_cached: bool = False):
+        """Crea o reutiliza un RTree wrapper. Si reuse_cached=True, usa cache por sesión."""
+        if reuse_cached and field in self._cached_rtree:
+            return self._cached_rtree[field]
         idx_meta = self.indexes[field]
         idx_filename = idx_meta["filename"]
         data_dir = os.path.dirname(os.path.dirname(idx_filename))
-        return RTree(
+        rt = RTree(
             self.table, field, data_dir,
             key=field,
             M=int(idx_meta.get("M", 32)),
             heap_file=(self.indexes["primary"]["filename"] if heap_ok else None)
         )
+        if reuse_cached:
+            self._cached_rtree[field] = rt
+        return rt
+
+    def _close_cached_rtrees(self):
+        """Cierra todos los RTree cacheados (persist header)."""
+        for rt in self._cached_rtree.values():
+            rt.close()
+        self._cached_rtree.clear()
 
     def _as_point(self, v):
         import json
-        if isinstance(v, str) and v.startswith("[") and v.endswith("]"):
-            try: v = json.loads(v)
-            except Exception: return False, None
+        if isinstance(v, str):
+            s = v.strip()
+            # JSON list: "[55,3]"
+            if s.startswith("[") and s.endswith("]"):
+                try:
+                    j = json.loads(s)
+                    if isinstance(j, (list, tuple)) and len(j) >= 2:
+                        return True, [float(j[0]), float(j[1])]
+                except Exception:
+                    pass
+            # CSV-like: "55,3"
+            if "," in s:
+                try:
+                    x_str, y_str = s.split(",", 1)
+                    return True, [float(x_str), float(y_str)]
+                except Exception:
+                    pass
         if isinstance(v, (list, tuple)) and len(v) >= 2 \
-           and isinstance(v[0], (int, float)) and isinstance(v[1], (int, float)):
+                and isinstance(v[0], (int, float)) and isinstance(v[1], (int, float)):
             return True, [float(v[0]), float(v[1])]
         return False, None
 
@@ -163,16 +189,59 @@ class File:
             self.index_log("primary", "heap", self.primary_key, "search_by_pos")
             return out
 
-        out = []
-        for it in items:
-            if isinstance(it, dict) and "pos" in it:
-                pk = it["pos"]
-                out.extend(self.search({"op": "search", "field": self.primary_key, "value": pk}))
-        return out
+        # No-heap: 'pos' transporta la PK (numérica). Resolvemos directamente con el índice primario.
+        mainidx = (self.indexes.get("primary") or {}).get("index")
+        mainfile = (self.indexes.get("primary") or {}).get("filename")
+        if not mainidx or not mainfile:
+            return []
+
+        # Accept any PK type (int, str, etc.) - RTree wrapper may reverse-map surrogates
+        pks = [it["pos"] for it in items if isinstance(it, dict) and ("pos" in it)]
+        if not pks:
+            return []
+
+        results = []
+        try:
+            if mainidx == "sequential":
+                sf = SeqFile(mainfile)
+                for pk in pks:
+                    recs = sf.search({"key": self.primary_key, "value": pk, "unique": True}, same_key=True)
+                    results.extend(recs or [])
+                self.io_merge(sf, "sequential")
+                self.index_log("primary", "sequential", self.primary_key, "search_by_pk_batch", note=str(len(pks)))
+            elif mainidx == "isam":
+                isf = IsamFile(mainfile)
+                for pk in pks:
+                    recs = isf.search({"key": self.primary_key, "value": pk, "unique": True}, same_key=True)
+                    results.extend(recs or [])
+                self.io_merge(isf, "isam")
+                self.index_log("primary", "isam", self.primary_key, "search_by_pk_batch", note=str(len(pks)))
+            elif mainidx == "bplus":
+                bp = BPlusFile(mainfile)
+                for pk in pks:
+                    recs = bp.search({"key": self.primary_key, "value": pk, "unique": True}, same_key=True)
+                    results.extend(recs or [])
+                self.io_merge(bp, "bplus")
+                self.index_log("primary", "bplus", self.primary_key, "search_by_pk_batch", note=str(len(pks)))
+            else:
+                # fallback a recursion si aparece algún modo no considerado
+                for pk in pks:
+                    results.extend(self.search({"op": "search", "field": self.primary_key, "value": pk}) or [])
+        except Exception:
+            # ante cualquier error, intenta fallback por búsqueda estándar
+            tmp = []
+            for pk in pks:
+                tmp.extend(self.search({"op": "search", "field": self.primary_key, "value": pk}) or [])
+            results = tmp
+        return results
 
     def _usable_secondary_kind(self, field: str):
+        # Nunca prefieras un "secundario" cuando el campo es la PK.
+        if field == self.primary_key:
+            return None
         meta = self.indexes.get(field)
-        if not meta: return None
+        if not meta:
+            return None
         kind = (meta.get("index") or "").lower()
         return kind if kind in ("hash", "bplus", "rtree") else None
 
@@ -217,7 +286,7 @@ class File:
                         in_rec = ({"pos": rec.get("pos"), index: rec[index], "deleted": False}
                                   if self.indexes["primary"]["index"] == "heap"
                                   else {"pk": rec[self.primary_key], index: rec[index], "deleted": False})
-                        h.insert(in_rec, key_name=index)
+                        h.insert(in_rec, index)
                     self.io_merge(h, "hash")
                     self.index_log("secondary", "hash", index, "build")
                 except Exception as e:
@@ -248,6 +317,7 @@ class File:
                                   if self.indexes["primary"]["index"] == "heap"
                                   else {"pk": rec[self.primary_key], index: pt, "deleted": False})
                         rt.insert(in_rec)
+                    rt.close()  # Explicit close for bulk build
                     self.io_merge(rt, "rtree")
                     self.index_log("secondary", "rtree", index, "build")
                 except Exception as e:
@@ -287,6 +357,7 @@ class File:
             if self.indexes[index]["filename"] == mainfilename and index != "primary":
                 additional["key"] = index
                 break
+
         for field in self.relation:
             if "key" in self.relation[field] and self.relation[field]["key"] in ("primary", "unique"):
                 additional["unique"].append(field)
@@ -325,9 +396,11 @@ class File:
             self.io_merge(isf, "isam")
 
         elif maindex == "bplus":
+            additional["key"] = self.primary_key
             bp = BPlusFile(mainfilename)
-            bp.insert(record, {"key": self.primary_key})
-            records = [record]                                   # [row_dict]
+            records = bp.insert(record, additional)
+            if not records:
+                records = [record]
             self.io_merge(bp, "bplus")
             self.index_log("primary", "bplus", self.primary_key, "insert")
 
@@ -336,6 +409,14 @@ class File:
 
         if len(records) >= 1:
             is_heap = (self.indexes["primary"]["index"] == "heap")
+
+            # --- Ensure cached rtrees are created ---
+            for index in self.indexes:
+                if index == "primary" or self.indexes[index]["filename"] == mainfilename:
+                    continue
+                if self.indexes[index]["index"] == "rtree":
+                    if index not in self._cached_rtree:
+                        self._make_rtree(index, heap_ok=is_heap, reuse_cached=True)
 
             for index in self.indexes:
                 if index == "primary" or self.indexes[index]["filename"] == mainfilename:
@@ -350,13 +431,13 @@ class File:
                         if is_heap:
                             for row_dict, pos in records:
                                 if index not in row_dict: continue
-                                rec = {"pos": pos, index: row_dict[index], "deleted": False}
-                                h.insert(rec, key_name=index)
+                                rec = {index: row_dict[index], "pos": pos, "deleted": False}
+                                h.insert(rec, index)
                         else:
                             for row_dict in records:
                                 if index not in row_dict: continue
-                                rec = {"pk": row_dict[self.primary_key], index: row_dict[index], "deleted": False}
-                                h.insert(rec, key_name=index)
+                                rec = {index: row_dict[index], "pk": row_dict[self.primary_key], "deleted": False}
+                                h.insert(rec, index)
                         self.io_merge(h, "hash")
                         self.index_log("secondary", "hash", index, "insert")
                     except Exception as e:
@@ -381,26 +462,26 @@ class File:
                         if DEBUG_IDX: print("[BPLUS insert secondary] skip:", e)
 
                 elif kind == "rtree":
-                    try:
-                        rt = self._make_rtree(index, heap_ok=is_heap)
-                        if is_heap:
-                            for row_dict, pos in records:
-                                if index not in row_dict: continue
-                                ok, pt = self._as_point(row_dict[index])
-                                if not ok: continue
-                                in_rec = {"pos": pos, index: pt, "deleted": False}
-                                rt.insert(in_rec)
-                        else:
-                            for row_dict in records:
-                                if index not in row_dict: continue
-                                ok, pt = self._as_point(row_dict[index])
-                                if not ok: continue
-                                in_rec = {"pk": row_dict[self.primary_key], index: pt, "deleted": False}
-                                rt.insert(in_rec)
-                        self.io_merge(rt, "rtree")
-                        self.index_log("secondary", "rtree", index, "insert")
-                    except Exception as e:
-                        if DEBUG_IDX: print("[RTREE insert secondary] skip:", e)
+                    # Access directly from cache to avoid local ref that triggers __del__
+                    rt = self._cached_rtree[index]
+                    if is_heap:
+                        for row_dict, pos in records:
+                            if index not in row_dict: continue
+                            ok, pt = self._as_point(row_dict[index])
+                            if not ok: continue
+                            in_rec = {"pos": pos, index: pt, "deleted": False}
+                            rt.insert(in_rec)
+                    else:
+                        for row_dict in records:
+                            if index not in row_dict: continue
+                            ok, pt = self._as_point(row_dict[index])
+                            if not ok: continue
+                            in_rec = {"pk": row_dict[self.primary_key], index: pt, "deleted": False}
+                            rt.insert(in_rec)
+                    # DO NOT close here; let import_csv close all at end
+                    if DEBUG_IDX: print(f"[RTREE insert secondary] after batch: records={len(records)}")
+                    self.io_merge(rt, "rtree")
+                    self.index_log("secondary", "rtree", index, "insert")
 
         self.last_io = self.io_get()
         return records
@@ -463,7 +544,8 @@ class File:
             if kind == "hash":
                 try:
                     h = ExtendibleHashingFile(filename)
-                    records = h.find(value, key_name=field)
+                    is_unique = additional.get("unique", False)
+                    records = h.find(value, field, unique=is_unique)
                     self.io_merge(h, "hash")
                     self.index_log("secondary", "hash", field, "search")
                 except Exception as e:
@@ -521,6 +603,14 @@ class File:
                 )
             records = ret_records
 
+            if records and isinstance(records, list):
+                first = records[0]
+                # Si ya tengo filas completas (tienen la PK y NO traen 'pk' token),
+                # entonces NO vuelvas a resolver por pk: regrésalas tal cual.
+                if isinstance(first, dict) and (self.primary_key in first) and ("pk" not in first):
+                    self.last_io = self.io_get()
+                    return records
+
         self.last_io = self.io_get()
         return records
 
@@ -564,7 +654,7 @@ class File:
                     bp = BPlusFile(mainfilename)
                     additional["min"] = params["min"]
                     additional["max"] = params["max"]
-                    records = bp.range_search(additional, same_key=True)
+                    records = bp.range_search(additional, same_key)
                     self.index_log("primary", "bplus", field, "range_search")
                     self.io_merge(bp, "bplus")
                 except Exception as e:
@@ -602,7 +692,7 @@ class File:
                     self.index_log("secondary", "rtree", field, "range_rect")
                     out = self._bridge_from_rtree(items)
                     self.last_io = self.io_get()
-                    records = out
+                    return out
                 except Exception as e:
                     if DEBUG_IDX: print("[RTREE range_search secondary] skip:", e)
                     return []
@@ -621,6 +711,12 @@ class File:
                     self.search({"op": "search", "field": self.primary_key, "value": rec["pk"]})
                 )
             records = ret_records
+
+            if records and isinstance(records, list):
+                first = records[0]
+                if isinstance(first, dict) and (self.primary_key in first) and ("pk" not in first):
+                    self.last_io = self.io_get()
+                    return records
 
         self.last_io = self.io_get()
         return records
@@ -709,10 +805,10 @@ class File:
                         if isinstance(rec, tuple) and len(rec) >= 2:
                             row = rec[0]
                             if index in row:
-                                try: h.remove(row[index], key_name=index)
+                                try: h.remove(row[index], index)
                                 except Exception: pass
                         elif isinstance(rec, dict) and index in rec:
-                            try: h.remove(rec[index], key_name=index)
+                            try: h.remove(rec[index], index)
                             except Exception: pass
                     self.io_merge(h, "hash")
                     self.index_log("secondary", "hash", index, "cleanup_after_remove")
@@ -759,6 +855,35 @@ class File:
                     if DEBUG_IDX: print("[RTREE remove secondary] skip:", e)
 
         self.last_io = self.io_get()
+        return records
+    
+    def get_all(self):
+        mainfilename = self.indexes["primary"]["filename"]
+        mainindx = self.indexes["primary"]["index"]
+
+        records = []
+    
+        if mainindx == "heap":
+            GetFile = HeapFile(mainfilename)
+            records = GetFile.get_all(True)
+            self.io_merge(GetFile, "heap")
+        elif mainindx == "sequential":
+            GetFile = SeqFile(mainfilename)
+            records = GetFile.get_all()
+            self.io_merge(GetFile, "sequential")
+        elif mainindx == "isam":
+            GetFile = IsamFile(mainfilename)
+            records = GetFile.get_all()
+            self.io_merge(GetFile, "isam")
+        elif mainindx == "bplus":
+            GetFile = BPlusFile(mainfilename)
+            records = GetFile.get_all()
+            self.io_merge(GetFile, "bplus")
+        else:
+            records = []
+
+        self.last_io = self.io_get()
+
         return records
 
     # ----------------------------------- execute ------------------------------------ #
@@ -811,7 +936,7 @@ class File:
                 return []
         elif params["op"] == "import_csv":
             path = params["path"]
-            inserted = 0
+            all_recs = []
             with open(path, newline="", encoding="utf-8") as f:
                 r = csv.DictReader(f)
                 for row in r:
@@ -830,7 +955,15 @@ class File:
                         elif t in ("float", "real", "f", "double"):
                             v = float(v)
                         rec[col] = v
-                    self.insert({"record": rec})
-                    inserted += 1
+                    all_recs.append(rec)
+            # Insert all at once (cached rtrees will accumulate across calls)
+            for rec in all_recs:
+                self.insert({"record": rec})
+            # Close all cached rtrees to persist headers
+            self._close_cached_rtrees()
+            if DEBUG_IDX: print(f"[import_csv] closed cached rtrees after {len(all_recs)} records")
             self.last_io = self.io_get()
-            return {"count": inserted}
+            return {"count": len(all_recs)}
+        
+        elif params["op"] == "get_all":
+            return self.get_all()

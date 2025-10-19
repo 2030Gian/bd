@@ -3,6 +3,8 @@ from dataclasses import dataclass, field
 from typing import List, Optional, Tuple
 import os, struct, io
 
+DEBUG_IDX = os.getenv("BD2_DEBUG_INDEX", "0").lower() in ("1", "true", "yes")
+
 MBR = Tuple[float, float, float, float]
 RID = Tuple[int, int]
 
@@ -39,8 +41,20 @@ class RTreeFile:
         if not self.opened:
             self.store.open()
             if self.store.root == 0:
-                root = Node(page_id=0, is_leaf=True, M=self.store.M)
-                self.store.write_node(root)
+                # Check if root page already exists and has content
+                try:
+                    root = self.store.read_node(0)
+                    if len(root.entries) > 0:
+                        # Root already populated, don't overwrite
+                        pass
+                    else:
+                        # Root exists but is empty, initialize it
+                        root = Node(page_id=0, is_leaf=True, M=self.store.M)
+                        self.store.write_node(root)
+                except Exception:
+                    # Root doesn't exist or error, create new
+                    root = Node(page_id=0, is_leaf=True, M=self.store.M)
+                    self.store.write_node(root)
             self.opened = True
 
     def close(self):
@@ -122,10 +136,18 @@ class RTreeFile:
 
     # ---------- public ops ----------
     def insert(self, record: dict, additional: dict) -> List[dict]:
-        """record debe traer: 'pos', opcional 'slot', y la columna espacial en additional['key']"""
+        """Inserta una entrada en el R-Tree.
+
+        Soporta dos modalidades de identificador en hojas:
+        - Primario HEAP: record['pos'] (y opcional record['slot'])
+        - Primario NO-HEAP: record['pk'] (slot=0)
+
+        La columna espacial debe venir en additional['key'].
+        """
         self.open()
         key = additional["key"]        # ej. "ubicacion"
         val = record[key]
+        if DEBUG_IDX: print(f"[RTREE insert] key={key} val={val} record={record}")
         if isinstance(val, (list, tuple)) and len(val) == 2:
             m = from_point(float(val[0]), float(val[1]))
         elif isinstance(val, (list, tuple)) and len(val) == 4:
@@ -144,7 +166,20 @@ class RTreeFile:
             cur = best.child
 
         # insertar en hoja
-        pos = record["pos"]; slot = record.get("slot", 0)
+        # Determinar identificador: posición de heap o pk (no-heap)
+        if "pos" in record and record["pos"] is not None:
+            pos = int(record["pos"])  # posición en heap
+            slot = int(record.get("slot", 0))
+        elif "pk" in record and record["pk"] is not None:
+            # Guardamos pk en el campo 'page' del RID y usamos slot=0
+            try:
+                pos = int(record["pk"])  # PK numérica requerida
+            except Exception as e:
+                raise ValueError("RTreeFile.insert: 'pk' debe ser numérica para primarios no-heap") from e
+            slot = 0
+        else:
+            raise KeyError("pos")  # mantener compat con manejo actual en capas superiores
+
         node.entries.append(Entry(mbr=m, rid=(pos, slot)))
         if len(node.entries) <= self.store.M:
             self.store.write_node(node)
@@ -383,17 +418,50 @@ class Storage:
         self.page_size = DEFAULT_PAGE_SIZE
         self.root = 0
         self.height = 1
-        self.read_count = 0
-        self.write_count = 0
+
+        # --- contadores internos (totales) + baseline para reportar delta ---
+        self._r_total = 0
+        self._w_total = 0
+        self._r_reported = 0
+        self._w_reported = 0
+
+    # --- propiedades: exponen DELTA y permiten setear TOTALES al cargar ---
+    @property
+    def read_count(self) -> int:
+        delta = self._r_total - self._r_reported
+        self._r_reported = self._r_total
+        return delta
+
+    @read_count.setter
+    def read_count(self, v: int):
+        self._r_total = int(v or 0)
+        self._r_reported = self._r_total
+
+    @property
+    def write_count(self) -> int:
+        delta = self._w_total - self._w_reported
+        self._w_reported = self._w_total
+        return delta
+
+    @write_count.setter
+    def write_count(self, v: int):
+        self._w_total = int(v or 0)
+        self._w_reported = self._w_total
 
     def open(self):
         os.makedirs(os.path.dirname(self.filename), exist_ok=True)
         if not os.path.exists(self.filename):
             with open(self.filename, "wb") as f:
-                f.write(struct.pack(HEADER_FMT, MAGIC, VERSION, self.M, self.m,
-                                    0, self.height, self.page_size,
-                                    self.read_count, self.write_count))
+                # archivo nuevo: persiste totales 0
+                f.write(struct.pack(
+                    HEADER_FMT, MAGIC, VERSION, self.M, self.m,
+                    0, self.height, self.page_size,
+                    0, 0
+                ))
                 f.write(b"\x00" * self.page_size)  # página 0
+            # baseline 0
+            self.read_count = 0
+            self.write_count = 0
         else:
             with open(self.filename, "rb") as f:
                 hdr = f.read(struct.calcsize(HEADER_FMT))
@@ -404,23 +472,37 @@ class Storage:
             # si el archivo estaba sucio (por ej., JSON), recrear
             if magic != MAGIC or ver != VERSION:
                 with open(self.filename, "wb") as f:
-                    self.root = 0; self.height = 1
-                    self.read_count = 0; self.write_count = 0
-                    f.write(struct.pack(HEADER_FMT, MAGIC, VERSION, self.M, self.m,
-                                        0, self.height, self.page_size,
-                                        self.read_count, self.write_count))
+                    self.root = 0
+                    self.height = 1
+                    # reinicia totales a 0
+                    self.read_count = 0
+                    self.write_count = 0
+                    f.write(struct.pack(
+                        HEADER_FMT, MAGIC, VERSION, self.M, self.m,
+                        0, self.height, self.page_size,
+                        0, 0
+                    ))
                     f.write(b"\x00" * self.page_size)
             else:
                 self.M, self.m, self.root, self.height = M, m, root, height
                 self.page_size = page_size
-                self.read_count, self.write_count = r, w
+                # inicializa TOTALES (+ baseline) desde header
+                self.read_count = r
+                self.write_count = w
 
     def close(self):
+        if DEBUG_IDX:
+            print(f"[Storage.close] root={self.root} height={self.height} filename={self.filename}")
         with open(self.filename, "r+b") as f:
             f.seek(0)
-            f.write(struct.pack(HEADER_FMT, MAGIC, VERSION, self.M, self.m,
-                                self.root, self.height, self.page_size,
-                                self.read_count, self.write_count))
+            # persiste TOTALES (no el delta)
+            f.write(struct.pack(
+                HEADER_FMT, MAGIC, VERSION, self.M, self.m,
+                self.root, self.height, self.page_size,
+                self._r_total, self._w_total
+            ))
+        if DEBUG_IDX:
+            print(f"[Storage.close] wrote header with root={self.root} height={self.height}")
 
     # ---- páginas
     def alloc_page(self) -> int:
@@ -429,6 +511,8 @@ class Storage:
         used_pages = (size - header) // self.page_size
         with open(self.filename, "ab") as f:
             f.write(b"\x00" * self.page_size)
+        # cuenta la escritura de la nueva página
+        self._w_total += 1
         return used_pages
 
     # ---- nodos
@@ -449,13 +533,19 @@ class Storage:
         with open(self.filename, "r+b") as f:
             f.seek(struct.calcsize(HEADER_FMT) + node.page_id * self.page_size)
             f.write(data)
-        self.write_count += 1
+            f.flush()
+            os.fsync(f.fileno())  # Force OS to write to disk
+        # contar escritura de página de nodo
+        self._w_total += 1
+        if DEBUG_IDX and node.is_leaf:
+            print(f"[write_node] wrote leaf page_id={node.page_id} entries={len(node.entries)}")
 
     def read_node(self, page_id: int) -> Node:
         with open(self.filename, "rb") as f:
             f.seek(struct.calcsize(HEADER_FMT) + page_id * self.page_size)
             raw = f.read(self.page_size)
-        self.read_count += 1
+        # contar lectura de página de nodo
+        self._r_total += 1
         is_leaf, count = struct.unpack_from("<B H", raw, 0)
         off = 3
         entries: List[Entry] = []
@@ -532,15 +622,120 @@ class RTree:
         idx_dir.mkdir(parents=True, exist_ok=True)
         self.filename = str(idx_dir / f"{table}_rtree_{column}.idx")
         self.rt = RTreeFile(self.filename, M=M)
+
+        # contadores como atributos (se actualizarán con _sync_io_counts)
         self.read_count = self.rt.store.read_count
         self.write_count = self.rt.store.write_count
 
+        # Sidecar mapping for non-integer PK support: pk <-> int surrogate
+        self.mapfile = str(idx_dir / f"{table}_rtree_{column}.map.json")
+        self._p2i = {}
+        self._i2p = {}
+        self._next_id = 1
+        self._load_map()
+
+    # ---------- helpers ----------
+    def _sync_io_counts(self):
+        """Sincroniza los atributos públicos con los contadores del Storage."""
+        self.read_count = self.rt.store.read_count
+        self.write_count = self.rt.store.write_count
+
+    # ---------- mapping helpers (non-int PK support) ----------
+    def _load_map(self):
+        import json
+        try:
+            if os.path.exists(self.mapfile):
+                with open(self.mapfile, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+                self._p2i = data.get("p2i", {}) or {}
+                self._i2p = data.get("i2p", {}) or {}
+                self._next_id = int(data.get("next_id", 1) or 1)
+        except Exception:
+            # tolerate corrupt map; start fresh (won't affect numeric PKs)
+            self._p2i, self._i2p, self._next_id = {}, {}, 1
+
+    def _save_map(self):
+        import json
+        try:
+            with open(self.mapfile, "w", encoding="utf-8") as f:
+                json.dump({
+                    "next_id": self._next_id,
+                    "p2i": self._p2i,
+                    "i2p": self._i2p,
+                }, f, ensure_ascii=False)
+        except Exception:
+            pass
+
+    def _pk_key(self, pk):
+        # Stable JSON string key for dicts; for scalars, str() is fine but we use json to handle types
+        import json
+        try:
+            return json.dumps(pk, ensure_ascii=False, sort_keys=True)
+        except Exception:
+            return str(pk)
+
+    def _pk_to_int(self, pk):
+        # If already int-like, return as int
+        try:
+            if isinstance(pk, bool):
+                # avoid True/False becoming 1/0 unintentionally for string PKs
+                raise ValueError()
+            if isinstance(pk, int):
+                return int(pk)
+        except Exception:
+            pass
+        k = self._pk_key(pk)
+        if k in self._p2i:
+            return int(self._p2i[k])
+        # assign new surrogate id
+        sid = int(self._next_id)
+        self._next_id = sid + 1
+        self._p2i[k] = sid
+        self._i2p[str(sid)] = k
+        self._save_map()
+        return sid
+
+    def _int_to_pk(self, sid):
+        # If mapping exists, return original PK (deserialize JSON); else assume sid is the real PK (numeric)
+        import json
+        sk = str(int(sid))
+        if sk in self._i2p:
+            v = self._i2p[sk]
+            try:
+                return json.loads(v)
+            except Exception:
+                return v
+        return int(sid)
+
+    def close(self):
+        """Cierra el archivo R-Tree subyacente (persiste el header con root/height actualizado)."""
+        if DEBUG_IDX:
+            print(f"[RTree.close] filename={self.filename} root={self.rt.store.root} height={self.rt.store.height} opened={self.rt.opened}")
+        self.rt.close()
+        self._sync_io_counts()
+        if DEBUG_IDX:
+            print(f"[RTree.close] after rt.close() opened={self.rt.opened} read={self.read_count} write={self.write_count}")
+
+    def __del__(self):
+        """Finalizer: Cierra el RTreeFile al destruir el wrapper (CPython: cierre al salir de scope)."""
+        try:
+            if DEBUG_IDX:
+                print(f"[RTree.__del__] filename={self.filename}")
+            self.close()
+        except Exception:
+            pass
+
     # --- escritura ---
     def insert(self, record: dict):
-        # 'record' DEBE incluir 'pos' y opcionalmente 'slot'
-        # 'key' es la columna espacial (p.ej. "coords", "ubicacion", etc.)
+        # 'record' puede incluir 'pos' (heap) o 'pk' (no-heap)
+        # Si 'pk' es no entero, usamos un surrogate int y lo almacenamos en el árbol
         additional = {"key": self.key, "heap": self.heap_file}
-        return self.rt.insert(record, additional)
+        rec = dict(record)
+        if "pk" in rec and rec["pk"] is not None and not isinstance(rec["pk"], int):
+            rec["pk"] = self._pk_to_int(rec["pk"])  # map non-int pk to surrogate
+        res = self.rt.insert(rec, additional)
+        self._sync_io_counts()
+        return res
 
     def remove(self, record: dict):
         """
@@ -570,15 +765,50 @@ class RTree:
         if self.heap_file:
             add["heap"] = self.heap_file
 
-        return self.rt.remove(add)
-
+        res = self.rt.remove(add)
+        self._sync_io_counts()
+        return res
 
     # --- lecturas ---
     def search_rect(self, xmin: float, xmax: float, ymin: float, ymax: float):
-        return self.rt.search({"rect": (xmin, xmax, ymin, ymax), "heap": self.heap_file})
+        items = self.rt.search({"rect": (xmin, xmax, ymin, ymax), "heap": self.heap_file})
+        # Map back surrogate ids to original PKs when not using heap
+        if not self.heap_file:
+            out = []
+            for it in (items or []):
+                if isinstance(it, dict) and "pos" in it and isinstance(it.get("pos"), int):
+                    it = dict(it)
+                    it["pos"] = self._int_to_pk(it["pos"])  # may return int (original) or non-int
+                out.append(it)
+            self._sync_io_counts()
+            return out
+        self._sync_io_counts()
+        return items
 
     def range(self, x: float, y: float, r: float):
-        return self.rt.range_search({"point": (x, y), "r": r, "heap": self.heap_file})
+        items = self.rt.range_search({"point": (x, y), "r": r, "heap": self.heap_file})
+        if not self.heap_file:
+            out = []
+            for it in (items or []):
+                if isinstance(it, dict) and "pos" in it and isinstance(it.get("pos"), int):
+                    it = dict(it)
+                    it["pos"] = self._int_to_pk(it["pos"])  # reverse map
+                out.append(it)
+            self._sync_io_counts()
+            return out
+        self._sync_io_counts()
+        return items
 
     def knn(self, x: float, y: float, k: int):
-        return self.rt.knn({"point": (x, y), "k": int(k), "heap": self.heap_file})
+        items = self.rt.knn({"point": (x, y), "k": int(k), "heap": self.heap_file})
+        if not self.heap_file:
+            out = []
+            for it in (items or []):
+                if isinstance(it, dict) and "pos" in it and isinstance(it.get("pos"), int):
+                    it = dict(it)
+                    it["pos"] = self._int_to_pk(it["pos"])  # reverse map
+                out.append(it)
+            self._sync_io_counts()
+            return out
+        self._sync_io_counts()
+        return items

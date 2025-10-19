@@ -2,12 +2,16 @@ import struct
 from backend.core.record import Record
 from backend.catalog.catalog import get_json
 from backend.core.utils import build_format
-
-BUCKET_SIZE = 3
+ 
+BUCKET_SIZE = 5
 HEADER_FORMAT = 'ii'
 HEADER_SIZE = struct.calcsize(HEADER_FORMAT)
+FILE_HEADER_FORMAT_OLD = 'ii'
+FILE_HEADER_FORMAT = 'iii'
+FILE_HEADER_SIZE_OLD = struct.calcsize(FILE_HEADER_FORMAT_OLD) 
+FILE_HEADER_SIZE = struct.calcsize(FILE_HEADER_FORMAT) 
 INITIAL_MAX_CHAIN = 2
-
+MAX_GLOBAL_DEPTH = 20 
 
 # ================== Bucket ==================
 class Bucket:
@@ -18,9 +22,6 @@ class Bucket:
 
     def is_full(self):
         return len(self.records) >= BUCKET_SIZE
-
-    def is_empty(self):
-        return len(self.records) == 0
 
     def put(self, record):
         if not self.is_full():
@@ -74,10 +75,15 @@ class ExtendibleHashingFile:
         self.record_size = struct.calcsize(self.format)
         self.bucket_disk_size = self.record_size * BUCKET_SIZE
 
+        self._json_offset_cached = None
+        self._pages_base_offset_cached = None
+
         # Estado en memoria
         self.global_depth = 1
         self.directory = [0, 1]
         self.next_page_idx = 2
+        self.dir_capacity = 2 
+        self._file_header_size = FILE_HEADER_SIZE
         self.read_count = 0
         self.write_count = 0
 
@@ -85,18 +91,29 @@ class ExtendibleHashingFile:
         self._load_or_init()
 
     def _json_offset(self) -> int:
+        if self._json_offset_cached is not None:
+            return self._json_offset_cached
         try:
             with open(self.filename, 'rb') as f:
                 b = f.read(4)
+                self.read_count += 1
                 if not b or len(b) < 4:
+                    self._json_offset_cached = 0
                     return 0
                 size = struct.unpack('I', b)[0]
-                return 4 + size
+                self._json_offset_cached = 4 + size
+                return self._json_offset_cached
         except FileNotFoundError:
+            self._json_offset_cached = 0
             return 0
 
     def _pages_base_offset(self) -> int:
-        return self._json_offset() + 8 + len(self.directory) * 4
+        # Región de páginas empieza después del file header + directorio (capacidad actual)
+        if self._pages_base_offset_cached is not None:
+            return self._pages_base_offset_cached
+        base = self._json_offset() + self._file_header_size + (self.dir_capacity * 4)
+        self._pages_base_offset_cached = base
+        return base
 
     def _get_page_offset(self, page_idx):
         return self._pages_base_offset() + page_idx * (HEADER_SIZE + self.bucket_disk_size)
@@ -110,10 +127,6 @@ class ExtendibleHashingFile:
         h = self._hash(key)
         return h & ((1 << self.global_depth) - 1)
 
-    def _get_key_hash_prefix(self, key, depth):
-        h = self._hash(key)
-        return h & ((1 << depth) - 1)
-
     def _max_chain_length(self):
         return INITIAL_MAX_CHAIN + self.global_depth
 
@@ -122,18 +135,41 @@ class ExtendibleHashingFile:
             with open(self.filename, 'r+b') as f:
                 off = self._json_offset()
                 f.seek(off)
-                header = f.read(8)
-                if not header or header == b'\x00' * 8:
+                # Intentar leer header nuevo primero
+                header = f.read(FILE_HEADER_SIZE)
+                if header and header != b'\x00' * FILE_HEADER_SIZE:
+                    self.read_count += 1
+                    gd, npi, cap = struct.unpack(FILE_HEADER_FORMAT, header)
+                    self.global_depth, self.next_page_idx = gd, npi
+                    self.dir_capacity = max(2, cap)
+                    self._file_header_size = FILE_HEADER_SIZE
+                    # Leer directorio con padding a dir_capacity, truncar a 2^global_depth
+                    dir_bytes = f.read(self.dir_capacity * 4)
+                    real_dir = 1 << self.global_depth
+                    if len(dir_bytes) < real_dir * 4:
+                        self._init_file()
+                        return
+                    unpacked = list(struct.unpack(f'{self.dir_capacity}i', dir_bytes))
+                    self.directory = unpacked[:real_dir]
+                    self._pages_base_offset_cached = None
+                    return
+                # Fallback: intentar header legacy (8 bytes)
+                f.seek(off)
+                header_old = f.read(FILE_HEADER_SIZE_OLD)
+                if not header_old or header_old == b'\x00' * FILE_HEADER_SIZE_OLD:
                     self._init_file()
                     return
                 self.read_count += 1
-                self.global_depth, self.next_page_idx = struct.unpack('ii', header)
-                dir_size = 1 << self.global_depth
-                dir_bytes = f.read(dir_size * 4)
-                if len(dir_bytes) != dir_size * 4:
+                gd, npi = struct.unpack(FILE_HEADER_FORMAT_OLD, header_old)
+                self.global_depth, self.next_page_idx = gd, npi
+                self.dir_capacity = max(2, (1 << self.global_depth))
+                self._file_header_size = FILE_HEADER_SIZE_OLD
+                dir_bytes = f.read((1 << self.global_depth) * 4)
+                if len(dir_bytes) != (1 << self.global_depth) * 4:
                     self._init_file()
                     return
-                self.directory = list(struct.unpack(f'{dir_size}i', dir_bytes))
+                self.directory = list(struct.unpack(f'{1 << self.global_depth}i', dir_bytes))
+                self._pages_base_offset_cached = None
         except FileNotFoundError:
             self._init_file()
 
@@ -141,6 +177,8 @@ class ExtendibleHashingFile:
         self.global_depth = 1
         self.directory = [0, 1]
         self.next_page_idx = 2
+        self.dir_capacity = 2
+        self._file_header_size = FILE_HEADER_SIZE
         try:
             f = open(self.filename, 'r+b')
         except FileNotFoundError:
@@ -148,13 +186,20 @@ class ExtendibleHashingFile:
         with f:
             off = self._json_offset()
             f.seek(off)
-            f.write(struct.pack('ii', self.global_depth, self.next_page_idx))
-            f.write(struct.pack(f'{len(self.directory)}i', *self.directory))
+            # Escribir header nuevo y directorio con padding a capacidad
+            f.write(struct.pack(FILE_HEADER_FORMAT, self.global_depth, self.next_page_idx, self.dir_capacity))
+            padded_dir = self.directory + [-1] * (self.dir_capacity - len(self.directory))
+            f.write(struct.pack(f'{self.dir_capacity}i', *padded_dir))
+            self.write_count += 2
+            # Invalidar cache
+            self._pages_base_offset_cached = None
 
             f.seek(self._get_page_offset(0))
             f.write(struct.pack('i', 1))
             f.write(struct.pack('i', -1))
             f.write(b'\x00' * self.bucket_disk_size)
+
+            self.write_count+=3
 
             f.seek(self._get_page_offset(1))
             f.write(struct.pack('i', 1))
@@ -181,15 +226,38 @@ class ExtendibleHashingFile:
             f.write(struct.pack('i', bucket.local_depth))
             f.write(struct.pack('i', bucket.overflow_page))
             f.write(bucket.pack(self.record_size, self.format, self.schema))
-            self.write_count += 1
+            self.write_count += 3
 
     def _write_directory(self):
+        # Reescribe header y directorio con padding a capacidad
         with open(self.filename, 'r+b') as f:
             base = self._json_offset()
             f.seek(base)
-            f.write(struct.pack('ii', self.global_depth, self.next_page_idx))
-            f.write(struct.pack(f'{len(self.directory)}i', *self.directory))
-            self.write_count += 1
+            f.write(struct.pack(FILE_HEADER_FORMAT, self.global_depth, self.next_page_idx, self.dir_capacity))
+            real_dir = 1 << self.global_depth
+            padded_dir = self.directory + [-1] * (self.dir_capacity - real_dir)
+            f.write(struct.pack(f'{self.dir_capacity}i', *padded_dir))
+            self.write_count += 2
+        self._pages_base_offset_cached = None
+
+    def _grow_directory(self, new_capacity: int):
+        """Aumenta la capacidad del directorio y reubica la región de páginas si cambia el offset."""
+        new_capacity = max(new_capacity, 1 << self.global_depth)
+        if new_capacity <= self.dir_capacity:
+            return
+        # Calcular offsets antiguos/nuevos y tamaño región páginas
+        old_pages_off = self._pages_base_offset()
+        page_span = HEADER_SIZE + self.bucket_disk_size
+        region_size = self.next_page_idx * page_span
+        new_pages_off = self._json_offset() + FILE_HEADER_SIZE + (new_capacity * 4)
+        # Leer y mover región de páginas
+        with open(self.filename, 'r+b') as f:
+            f.seek(old_pages_off)
+            data = f.read(region_size)
+            f.seek(new_pages_off)
+            f.write(data)
+        self.dir_capacity = new_capacity
+        self._write_directory()
 
     def _read_chain(self, page_idx):
         chain = []
@@ -200,209 +268,180 @@ class ExtendibleHashingFile:
             cur = b.overflow_page
         return chain
 
-    def _write_chain(self, chain):
-        for page_idx, bucket in chain:
-            self._write_bucket(page_idx, bucket)
-
-    def find(self, key_value, key_name="id"):
+    def find(self, key_value, key_name, unique=False):
+        """
+        Busca registros por key_value.
+        Si unique=True, corta en cuanto encuentra el primer match.
+        """
         if self.key_name is None:
             self.key_name = key_name
         dir_idx = self._get_bucket_idx(key_value)
         page_idx = self.directory[dir_idx]
         result = []
-        for _, bucket in self._read_chain(page_idx):
+        
+        cur = page_idx
+        while cur != -1:
+            bucket = self._read_bucket(cur)
             for rec in bucket.records:
                 if rec.fields[key_name] == key_value and not rec.fields.get("deleted", False):
                     result.append({k: v for k, v in rec.fields.items() if k != 'deleted'})
+                    if unique:
+                        return result 
+            cur = bucket.overflow_page
+        
         return result
 
-    def insert(self, record_data, key_name="id"):
+    def _chain_bit_counts(self, chain, bit_pos):
+        zeros = ones = 0
+        key = self.key_name or "id"
+        for _, b in chain:
+            for rec in b.records:
+                try:
+                    h = self._hash(rec.fields[key])
+                    if (h >> bit_pos) & 1:
+                        ones += 1
+                    else:
+                        zeros += 1
+                except Exception:
+                    pass
+        return zeros, ones
+
+    def insert(self, record_data, key_name):
         if self.key_name is None:
             self.key_name = key_name
 
         key_value = record_data[key_name]
-        rec = Record(self.schema, self.format, record_data)
-
-        # Usamos un bucle para manejar el caso en que un split nos obligue a reintentar la inserción
-        while True:
-            dir_idx = self._get_bucket_idx(key_value)
-            page_idx = self.directory[dir_idx]
-            chain = self._read_chain(page_idx)
-
-            # 1) Intentar insertar en algún bucket de la cadena
-            for curr_page, curr_bucket in chain:
-                if not curr_bucket.is_full():
-                    curr_bucket.put(rec)
-                    self._write_bucket(curr_page, curr_bucket)
-                    return record_data
-
-            # 2) Si la cadena aún no alcanzó el máximo -> encadenar otro bucket
-            if len(chain) < self._max_chain_length():
-                last_page, last_bucket = chain[-1]
-                new_overflow_page = self.next_page_idx
-                self.next_page_idx += 1
-
-                last_bucket.overflow_page = new_overflow_page
-                self._write_bucket(last_page, last_bucket)
-
-                new_overflow = Bucket(local_depth=last_bucket.local_depth)
-                new_overflow.put(rec)
-                self._write_bucket(new_overflow_page, new_overflow)
-                self._write_directory()  # Actualiza next_page_idx
-                return record_data
-
-            # 3) Si se alcanzó el máximo de la cadena -> hacer split y reintentar
-            self._split(page_idx)
-            # El bucle while se encargará de reintentar la inserción
-
-    def _split(self, page_idx):
-        chain = self._read_chain(page_idx)
-        head_page, head_bucket = chain[0]
-        old_local_depth = head_bucket.local_depth
-
-        # Si la profundidad local es igual a la global, duplicamos el directorio
-        if old_local_depth == self.global_depth:
-            self.directory.extend(self.directory)
-            self.global_depth += 1
-
-        new_page_idx = self.next_page_idx
-        self.next_page_idx += 1
-
-        new_bucket = Bucket(local_depth=old_local_depth + 1)
-        head_bucket.local_depth = old_local_depth + 1
-
-        # Redistribuir punteros del directorio
-        bit_to_check = 1 << old_local_depth
-        for i in range(len(self.directory)):
-            if self.directory[i] == page_idx and (i & bit_to_check):
-                self.directory[i] = new_page_idx
-
-        self._write_directory()
-
-        # Redistribuir registros
-        all_records = [record for _, b in chain for record in b.records]
-
-        # Limpiar la cadena original
-        head_bucket.records = []
-        head_bucket.overflow_page = -1
-        # Liberar páginas de desborde (en una implementación más compleja se añadirían a una lista de libres)
-        for p_idx, b in chain[1:]:
-            b.records = []
-            self._write_bucket(p_idx, b)  # Opcional: marcar como libre
-
-        new_chain = [(head_page, head_bucket)]
-        new_chain_overflow = [(new_page_idx, new_bucket)]
-
-        self._write_bucket(head_page, head_bucket)
-        self._write_bucket(new_page_idx, new_bucket)
-
-        key_name = self.key_name or "id"
-        for record in all_records:
-            key_value = record.fields[key_name]
-            h_prefix = self._get_key_hash_prefix(key_value, old_local_depth + 1)
-
-            target_chain = new_chain if (h_prefix & bit_to_check) == 0 else new_chain_overflow
-
-            inserted = False
-            for p, b in target_chain:
-                if not b.is_full():
-                    b.put(record)
-                    self._write_bucket(p, b)
-                    inserted = True
-                    break
-
-            if not inserted:  # Añadir página de desborde si es necesario
-                last_p, last_b = target_chain[-1]
-                new_p = self.next_page_idx
-                self.next_page_idx += 1
-
-                last_b.overflow_page = new_p
-                self._write_bucket(last_p, last_b)
-
-                new_b = Bucket(local_depth=old_local_depth + 1)
-                new_b.put(record)
-                self._write_bucket(new_p, new_b)
-                target_chain.append((new_p, new_b))
-                self._write_directory()
-
-    def remove(self, key_value, key_name="id"):
-        if self.key_name is None:
-            self.key_name = key_name
         dir_idx = self._get_bucket_idx(key_value)
         page_idx = self.directory[dir_idx]
         chain = self._read_chain(page_idx)
 
-        removed_records = []
+        # 1) intentar insertar en algún bucket de la cadena
         for curr_page, curr_bucket in chain:
-            removed = curr_bucket.remove(key_value, key_name)
-            if removed:
+            if not curr_bucket.is_full():
+                rec = Record(self.schema, self.format, record_data)
+                curr_bucket.put(rec)
                 self._write_bucket(curr_page, curr_bucket)
-                removed_records.extend([r.fields for r in removed])
+                return record_data
 
-        if not removed_records:
-            return None
+        # 2) si la cadena aún no alcanzó el máximo -> encadenar otro bucket (chaining)
+        if len(chain) < self._max_chain_length():
+            last_page, last_bucket = chain[-1]
+            new_overflow_page = self.next_page_idx
+            self.next_page_idx += 1
 
-        # Intenta fusionar si el bucket principal está vacío
-        # (implementación simplificada: solo fusiona si el bucket está completamente vacío)
-        head_page, head_bucket = chain[0]
-        if head_bucket.is_empty() and head_bucket.local_depth > 1:
-            self._try_merge(head_page)
+            last_bucket.overflow_page = new_overflow_page
+            self._write_bucket(last_page, last_bucket)
 
-        return removed_records
-
-    def _try_merge(self, page_idx):
-        bucket = self._read_bucket(page_idx)
-        if not bucket.is_empty() or bucket.local_depth <= 1:
-            return
-
-        # Encontrar el "buddy" bucket
-        buddy_prefix_mask = (1 << bucket.local_depth) - 1
-        my_prefix = self._get_key_hash_prefix(bucket.records[0].fields[self.key_name],
-                                              bucket.local_depth) if bucket.records else 0  # Simplificación
-
-        # El buddy tiene el bit más significativo invertido
-        buddy_bit = 1 << (bucket.local_depth - 1)
-        buddy_prefix = my_prefix ^ buddy_bit
-
-        buddy_page_idx = -1
-        for i, p_idx in enumerate(self.directory):
-            if self._get_key_hash_prefix(i, bucket.local_depth) == buddy_prefix:
-                buddy_page_idx = p_idx
-                break
-
-        if buddy_page_idx == -1 or buddy_page_idx == page_idx:
-            return
-
-        buddy_bucket = self._read_bucket(buddy_page_idx)
-
-        # Condición de fusión: misma profundidad local y suma de registros cabe en un bucket
-        if buddy_bucket.local_depth == bucket.local_depth and (
-                len(bucket.records) + len(buddy_bucket.records)) <= BUCKET_SIZE:
-            # Mover registros al buddy
-            buddy_bucket.records.extend(bucket.records)
-            buddy_bucket.local_depth -= 1
-
-            # Actualizar directorio
-            for i in range(len(self.directory)):
-                if self.directory[i] == page_idx:
-                    self.directory[i] = buddy_page_idx
-
-            self._write_bucket(buddy_page_idx, buddy_bucket)
-            # La página page_idx ahora está libre y podría ser reutilizada
-
-            # Intentar reducir el directorio si es posible
-            can_shrink = True
-            if self.global_depth > 1:
-                mid = len(self.directory) // 2
-                for i in range(mid):
-                    if self.directory[i] != self.directory[i + mid]:
-                        can_shrink = False
-                        break
-                if can_shrink:
-                    self.global_depth -= 1
-                    self.directory = self.directory[:mid]
+            new_overflow = Bucket(local_depth=last_bucket.local_depth, overflow_page=-1)
+            rec = Record(self.schema, self.format, record_data)
+            new_overflow.put(rec)
+            self._write_bucket(new_overflow_page, new_overflow)
 
             self._write_directory()
+            return record_data
+
+        # 3) si se alcanzó el máximo de la cadena -> intentar split
+        head_bucket = chain[0][1]
+        old_local = head_bucket.local_depth
+        zeros, ones = self._chain_bit_counts(chain, old_local)
+        splittable = (zeros > 0 and ones > 0)
+
+        self._split(dir_idx, page_idx, chain)
+
+        dir_idx = self._get_bucket_idx(key_value)
+        page_idx = self.directory[dir_idx]
+        new_chain = self._read_chain(page_idx)
+        for curr_page, curr_bucket in new_chain:
+            if not curr_bucket.is_full():
+                rec = Record(self.schema, self.format, record_data)
+                curr_bucket.put(rec)
+                self._write_bucket(curr_page, curr_bucket)
+                return record_data
+
+        # 4) fallback: si el split no ayudó
+        last_page, last_bucket = new_chain[-1]
+        new_overflow_page = self.next_page_idx
+        self.next_page_idx += 1
+
+        last_bucket.overflow_page = new_overflow_page
+        self._write_bucket(last_page, last_bucket)
+
+        new_overflow = Bucket(local_depth=last_bucket.local_depth, overflow_page=-1)
+        rec = Record(self.schema, self.format, record_data)
+        new_overflow.put(rec)
+        self._write_bucket(new_overflow_page, new_overflow)
+
+        self._write_directory()
+        return record_data
+
+    def _split(self, dir_idx, page_idx, chain):
+        head_bucket = chain[0][1]
+        old_local = head_bucket.local_depth
+
+        if old_local == self.global_depth:
+            self.directory = self.directory + self.directory
+            self.global_depth += 1
+            # Asegurar capacidad suficiente (doblar si es necesario)
+            if (1 << self.global_depth) > self.dir_capacity:
+                self._grow_directory(max(self.dir_capacity * 2, 1 << self.global_depth))
+
+        new_page_idx = self.next_page_idx
+        self.next_page_idx += 1
+
+        old_records = []
+        for _, b in chain:
+            old_records.extend(b.records)
+
+        for curr_page, curr_bucket in chain:
+            curr_bucket.records = []
+            curr_bucket.overflow_page = -1
+            self._write_bucket(curr_page, curr_bucket)
+
+        head_bucket.local_depth = old_local + 1
+        head_bucket.records = []
+        head_bucket.overflow_page = -1
+
+        new_bucket = Bucket(local_depth=old_local + 1, overflow_page=-1)
+
+        stride_bit = 1 << old_local
+        for i in range(len(self.directory)):
+            if self.directory[i] == page_idx:
+                if (i & stride_bit) != 0:
+                    self.directory[i] = new_page_idx
+                else:
+                    self.directory[i] = page_idx
+
+        self._write_bucket(page_idx, head_bucket)
+        self._write_bucket(new_page_idx, new_bucket)
+        self._write_directory()
+
+        for rec in old_records:
+            self.insert(rec.fields, self.key_name)
+
+    def remove(self, key_value, key_name="id", unique=False):
+        """
+        Remueve registros que coincidan con key_value.
+        Si unique=True, corta en cuanto remueva el primero.
+        """
+        if self.key_name is None:
+            self.key_name = key_name
+        dir_idx = self._get_bucket_idx(key_value)
+        page_idx = self.directory[dir_idx]
+        removed = []
+        
+        # Recorrer cadena bucket por bucket
+        cur = page_idx
+        while cur != -1:
+            bucket = self._read_bucket(cur)
+            rem = bucket.remove(key_value, key_name)
+            if rem:
+                self._write_bucket(cur, bucket)
+                removed.extend([r.fields for r in rem])
+                if unique:
+                    return removed  # Cortar si unique y ya removimos uno
+            cur = bucket.overflow_page
+        
+        return removed if removed else None
 
     def get_all_records(self):
         all_records = []
