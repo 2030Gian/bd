@@ -127,6 +127,7 @@ Para validar la eficiencia y cumplir con el requisito de comparación, se contra
 
 
 
-[Image of performance comparison graph]
+<img width="989" height="590" alt="spimigistlike" src="https://github.com/user-attachments/assets/dbb445c6-3149-4258-bc81-36d6993f0c55" />
+
 
 *(El gráfico muestra la disparidad masiva entre el enfoque secuencial y los enfoques indexados, validando la implementación).*
