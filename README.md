@@ -48,4 +48,37 @@ Para determinar la relevancia, se implementó la **Similitud de Coseno** utiliza
 * **IDF (Inverse Document Frequency):** Se pre-calcula en una fase "offline" posterior a la fusión y se almacena en un archivo ligero (`idf.json`).
 * **Normas ($||d||$):** Para evitar calcular la longitud del vector del documento en tiempo de consulta, se pre-calculan y almacenan en `normas.json`.
 
+## 3. Ejecución Eficiente de Consultas (Similitud de Coseno)
 
+La eficiencia del sistema no radica solo en la fórmula matemática, sino en la **estrategia de acceso a datos**. A diferencia de un escaneo secuencial que tiene una complejidad lineal $O(N)$, nuestra implementación utiliza una arquitectura de indexación de dos niveles que reduce drásticamente el espacio de búsqueda.
+
+### 3.1. Estructura de Datos: Acceso Directo (Random Access)
+
+Para cumplir con la restricción de **no cargar el índice completo en RAM**, implementamos una estructura híbrida:
+
+1.  **Lexicon en Memoria (RAM):** Es un Hash Map (`Diccionario`) ligero que reside en memoria principal. Su función es mapear cada término $t$ a su **ubicación física exacta** (offset en bytes) en el disco.
+    * *Complejidad de acceso: $O(1)$.*
+
+2.  **El Índice Invertido (Disco):** Es un archivo secuencial masivo (`.jsonl`) que contiene las *Posting Lists* (listas de documentos y frecuencias). Solo accedemos a él mediante "saltos" precisos (`seek`).
+
+3.  **Normas Pre-calculadas (RAM):** Un arreglo que contiene la magnitud $|d|$ de cada documento, necesario para la normalización del coseno.
+
+**Visualización Conceptual:**
+
+### 3.2. Algoritmo de Consulta (Query Processing)
+
+Cuando el sistema recibe una consulta (ej. *"sostenibilidad y finanzas"*), ejecuta el siguiente algoritmo de **Recuperación Dispersa**:
+
+1.  **Vectorización de la Consulta ($q$):** Se preprocesa la consulta y se calculan los pesos TF-IDF de sus términos en memoria.
+
+2.  **Acceso Directo (Seek & Fetch):** Para cada término relevante en la consulta:
+    * **Lookup:** Se busca el término en el *Lexicon*. Si no existe, se ignora (poda de búsqueda).
+    * **Seek:** Si existe, obtenemos el *byte offset* (ej. byte 84500). El puntero de archivo del sistema operativo "salta" instantáneamente a esa posición (`file.seek(84500)`).
+    * **Fetch:** Se lee **una sola línea** del disco (la *posting list* de ese término).
+    * *Impacto:* En lugar de leer GBs de datos, leemos solo unos pocos KBs.
+
+3.  **Cálculo de Similitud (Ranking):** Se utiliza un acumulador para sumar los productos punto solo de los documentos recuperados:
+    $$Score(d) += W_{t,q} \times W_{t,d}$$
+
+4.  **Normalización Final:** Finalmente, aplicamos la fórmula del Coseno dividiendo por las normas pre-calculadas (que ya están en RAM, evitando lecturas adicionales):
+    $$Sim(q, d) = \frac{q \cdot d}{|q| \times |d|}$$
