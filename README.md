@@ -38,46 +38,10 @@ graph TD
     
     G -->|Heap de Prioridad| H[Índice Invertido Final]
     H --> I[Cálculo de Pesos Offline: IDF y Normas]
-### 3. Ejecución Eficiente de Consultas (Similitud de Coseno)
+## 2.2. Modelo de Recuperación y Ranking
 
-La eficiencia del sistema no radica solo en la fórmula matemática, sino en la **estrategia de acceso a datos**. A diferencia de un escaneo secuencial que tiene una complejidad de $O(N)$ (donde $N$ es el total de documentos), nuestra implementación utiliza una arquitectura de indexación que reduce drásticamente el espacio de búsqueda.
+Para determinar la relevancia, se implementó la **Similitud de Coseno** utilizando el esquema de pesado **TF-IDF**.
 
-#### 3.1. Estructura de Datos: Analogía con Árboles de Búsqueda (AVL)
-Para entender por qué nuestra consulta es rápida, podemos usar la analogía de un **Árbol AVL (o B-Tree)**:
-
-* **En un Árbol:** No recorres todos los nodos para encontrar un dato. La estructura te permite "descartar" ramas enteras y saltar directamente al nodo deseado en tiempo logarítmico.
-* **En nuestro Índice Invertido:** No leemos todos los documentos. Utilizamos una estructura auxiliar en memoria (el **Lexicon**) que actúa como los punteros del árbol.
-
-**Arquitectura Híbrida (RAM + Disco):**
-
-
-
-1.  **El Lexicon (RAM):** Es un Hash Map (`Diccionario`) que reside en memoria principal. Su función es mapear cada término $t$ a su **ubicación física exacta** (offset en bytes) en el disco.
-    * *Complejidad de acceso:* $O(1)$.
-2.  **El Índice Invertido (Disco):** Es un archivo secuencial masivo (`.jsonl`) que contiene las *Posting Lists*. Solo accedemos a él mediante "saltos" precisos.
-3.  **Normas Pre-calculadas (RAM):** Un arreglo ligero que contiene la magnitud $|\vec{d}|$ de cada documento, necesario para la normalización del coseno.
-
-#### 3.2. Algoritmo de Consulta (Query Processing)
-Cuando el sistema recibe una consulta (ej. *"sostenibilidad y finanzas"*), no escanea el archivo. Ejecuta el siguiente algoritmo de **Recuperación Dispersa**:
-
-1.  **Vectorización de la Consulta ($\vec{q}$):**
-    Se preprocesa la consulta y se calculan los pesos TF-IDF de sus términos en memoria.
-
-2.  **Acceso Directo (Seek & Fetch):**
-    Para cada término relevante en la consulta:
-    * **Lookup:** Se busca el término en el *Lexicon*. Si no existe, se ignora (poda de búsqueda).
-    * **Seek:** Si existe, obtenemos el *byte offset* (ej. byte 84500). El puntero de archivo del sistema operativo "salta" instantáneamente a esa posición (`file.seek(84500)`).
-    * **Fetch:** Se lee **una sola línea** del disco (la *posting list* de ese término).
-    * *Impacto:* En lugar de leer GBs de datos, leemos solo unos pocos KBs.
-
-3.  **Cálculo de Similitud (Accumulator):**
-    Se utiliza un acumulador disperso para sumar los productos punto solo de los documentos que contienen los términos:
-    $$\text{DotProduct}(d) += W_{t,q} \times W_{t,d}$$
-
-4.  **Normalización y Ranking:**
-    Finalmente, aplicamos la fórmula del Coseno dividiendo por las normas pre-calculadas (que ya están en RAM, evitando lecturas adicionales):
-    $$\text{Sim}(q, d) = \frac{\vec{q} \cdot \vec{d}}{\|\vec{q}\| \cdot \|\vec{d}\|}$$
-
-
-
-**Conclusión:** Esta arquitectura garantiza que el tiempo de respuesta dependa del número de documentos que contienen los términos de la consulta ($k$), y no del tamaño total de la colección ($N$), logrando una complejidad de búsqueda sub-lineal.
+* **TF (Term Frequency):** Se calcula durante la fase SPIMI.
+* **IDF (Inverse Document Frequency):** Se pre-calcula en una fase "offline" posterior a la fusión y se almacena en un archivo ligero (`idf.json`).
+* **Normas ($||d||$):** Para evitar calcular la longitud del vector del documento en tiempo de consulta, se pre-calculan y almacenan en `normas.json`.
