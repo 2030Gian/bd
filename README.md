@@ -47,3 +47,5 @@ Para determinar la relevancia, se implementó la **Similitud de Coseno** utiliza
 * **TF (Term Frequency):** Se calcula durante la fase SPIMI.
 * **IDF (Inverse Document Frequency):** Se pre-calcula en una fase "offline" posterior a la fusión y se almacena en un archivo ligero (`idf.json`).
 * **Normas ($||d||$):** Para evitar calcular la longitud del vector del documento en tiempo de consulta, se pre-calculan y almacenan en `normas.json`.
+
+
