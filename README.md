@@ -56,7 +56,7 @@ La eficiencia del sistema no radica solo en la fórmula matemática, sino en la 
 
 Para cumplir con la restricción de **no cargar el índice completo en RAM**, implementamos una estructura híbrida:
 
-1.  **Lexicon en Memoria (RAM):** Es un Hash Map (`Diccionario`) ligero que reside en memoria principal. Su función es mapear cada término t a su **ubicación física exacta** (offset en bytes) en el disco.
+1.  **Lexicon en Memoria (RAM):** Es un Hash Map (`Diccionario`) ligero que reside en memoria principal. Su función es mapear cada término $t$ a su **ubicación física exacta** (offset en bytes) en el disco.
     * *Complejidad de acceso: $O(1)$.*
 
 2.  **El Índice Invertido (Disco):** Es un archivo secuencial masivo (`.jsonl`) que contiene las *Posting Lists* (listas de documentos y frecuencias). Solo accedemos a él mediante "saltos" precisos (`seek`).
