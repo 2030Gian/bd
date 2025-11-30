@@ -38,7 +38,9 @@ graph TD
     
     G -->|Heap de Prioridad| H[Índice Invertido Final]
     H --> I[Cálculo de Pesos Offline: IDF y Normas]
-## 2.2. Modelo de Recuperación y Ranking
+
+
+### 2.2. Modelo de Recuperación y Ranking
 
 Para determinar la relevancia, se implementó la **Similitud de Coseno** utilizando el esquema de pesado **TF-IDF**.
 
