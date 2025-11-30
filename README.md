@@ -38,7 +38,7 @@ graph TD
     
     G -->|Heap de Prioridad| H[Índice Invertido Final]
     H --> I[Cálculo de Pesos Offline: IDF y Normas]
-
+```
 
 ### 2.2. Modelo de Recuperación y Ranking
 
