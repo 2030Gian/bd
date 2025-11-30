@@ -111,7 +111,7 @@ Para validar la eficiencia y cumplir con el requisito de comparación, se contra
 
 | Método / Motor | Estrategia | Tiempo Promedio (ms) | Accesos a Disco |
 | :--- | :--- | :--- | :--- |
-| **PostgreSQL (Estándar)** | `WHERE contenido LIKE '%...%'` (Full Scan) | ~450 ms | $O(N)$ (Lectura total de ~33k filas) |
+| **PostgreSQL (Estándar)** | `WHERE contenido LIKE '%...%'` (Full Scan) | ~450 ms | O(N) (Lectura total de ~33k filas) |
 | **Nuestro Sistema** | **Índice Invertido SPIMI + Coseno** | **~12 ms** | **O(k) (Seek directo y lectura de posting list)** |
 | **PostgreSQL (Referencia)** | Índice GIN (`to_tsvector`) | ~9 ms | O(k) (Búsqueda en Árbol B+ invertido) |
 
