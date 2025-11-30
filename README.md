@@ -22,22 +22,30 @@ Para cumplir con el requisito de escalabilidad, se descartó la construcción de
 
 ```mermaid
 graph TD
-    A[Fuente de Datos: HeapFile Binario] -->|Lee Lote de 1000| B(Preprocesamiento NLP)
-    B --> C{¿Memoria Llena?}
-    C -- No --> B
-    C -- Sí --> D[Ordenar Términos Alfabéticamente]
-    D --> E[Escribir Bloque Temporal .jsonl a Disco]
-    E --> F{¿Más Datos?}
-    F -- Sí --> B
-    F -- No --> G[Fase de Fusión: K-Way Merge]
+    A[Inicio: HeapFile del Motor P1] --> B{Quedan datos?}
     
-    subgraph "Memoria Secundaria (Disco)"
-    E
-    G
+    %% Bucle
+    B -->|Si| C[Leer Lote de 1000]
+    C --> D[Preprocesamiento NLP]
+    D --> E[Construir Indice Local en RAM]
+    E --> F[Ordenar Terminos]
+    F --> G[Escribir bloque .jsonl a Disco]
+    G --> B
+    
+    %% Salida del Bucle
+    B -->|No| H[Fase de Fusion: K-Way Merge]
+    
+    %% Subgrafo para representar el disco
+    subgraph Memoria_Secundaria
+        G
+        H
+        I[(Indice Invertido Final)]
+        J[(Archivos Pesos: IDF/Normas)]
     end
     
-    G -->|Heap de Prioridad| H[Índice Invertido Final]
-    H --> I[Cálculo de Pesos Offline: IDF y Normas]
+    H -->|Min-Heap| I
+    I --> K[Calculo Offline de Pesos]
+    K --> J
 ```
 
 ### 2.2. Modelo de Recuperación y Ranking
